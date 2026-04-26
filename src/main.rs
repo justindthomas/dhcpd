@@ -406,7 +406,10 @@ fn print_response(resp: &ControlResponse) {
 }
 
 async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
+    // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
+    // stderr → journald.
     tracing_subscriber::fmt()
+        .with_ansi(std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,dhcpd=info")),

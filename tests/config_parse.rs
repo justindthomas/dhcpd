@@ -312,6 +312,42 @@ dhcp_server:
 }
 
 #[test]
+fn v4_subnet_v6_only_preferred_parses() {
+    let f = write_yaml(
+        r#"
+dhcp_server:
+  enabled: true
+  subnets:
+    - subnet: 10.0.5.0/24
+      pool_start: 10.0.5.100
+      pool_end:   10.0.5.200
+      v6_only_preferred: 1800
+"#,
+    );
+    let cfg = DhcpdConfig::load(f.path()).unwrap().unwrap();
+    assert_eq!(cfg.subnets[0].v6_only_preferred, Some(1800));
+}
+
+#[test]
+fn v4_subnet_v6_only_preferred_below_min_clamps_to_300() {
+    // RFC 8925 §3.5: clients clamp <300 to 300; load-time clamp
+    // keeps the wire value honest.
+    let f = write_yaml(
+        r#"
+dhcp_server:
+  enabled: true
+  subnets:
+    - subnet: 10.0.6.0/24
+      pool_start: 10.0.6.100
+      pool_end:   10.0.6.200
+      v6_only_preferred: 60
+"#,
+    );
+    let cfg = DhcpdConfig::load(f.path()).unwrap().unwrap();
+    assert_eq!(cfg.subnets[0].v6_only_preferred, Some(300));
+}
+
+#[test]
 fn v4_subnet_pool_outside_subnet_rejected() {
     let f = write_yaml(
         r#"

@@ -24,6 +24,7 @@
 //! |  60  | 2132 | Vendor Class Identifier        | `VendorClass`        |
 //! |  61  | 4361 | Client Identifier              | `ClientIdentifier`   |
 //! |  82  | 3046 | Relay Agent Information        | `RelayAgentInfo`     |
+//! | 108  | 8925 | IPv6-Only Preferred (V6ONLY_WAIT) | `V6OnlyPreferred` |
 //! | 121  | 3442 | Classless Static Route         | `ClasslessStaticRoute` |
 //! | 255  | 2132 | End                            | implicit             |
 
@@ -53,8 +54,13 @@ pub const OPT_REBINDING_TIME: u8 = 59;
 pub const OPT_VENDOR_CLASS: u8 = 60;
 pub const OPT_CLIENT_IDENTIFIER: u8 = 61;
 pub const OPT_RELAY_AGENT_INFO: u8 = 82;
+pub const OPT_V6_ONLY_PREFERRED: u8 = 108;
 pub const OPT_CLASSLESS_STATIC_ROUTE: u8 = 121;
 pub const OPT_END: u8 = 0xff;
+
+/// RFC 8925 §3.5: clients clamp any received V6ONLY_WAIT < 300 to 300.
+/// Servers SHOULD send a value at least this large.
+pub const MIN_V6ONLY_WAIT: u32 = 300;
 
 // Option 82 sub-option codes (RFC 3046).
 pub const SUBOPT_CIRCUIT_ID: u8 = 1;
@@ -117,6 +123,11 @@ pub enum DhcpOption {
     VendorClass(Vec<u8>),
     ClientIdentifier(Vec<u8>),
     RelayAgentInfo(Option82),
+    /// RFC 8925 — V6ONLY_WAIT timer in seconds. When present in a
+    /// DHCPOFFER/DHCPACK with `yiaddr=0`, tells the client to disable
+    /// IPv4 on this interface for the duration. Server only includes
+    /// this when the client requested option 108 in its PRL.
+    V6OnlyPreferred(u32),
     ClasslessStaticRoute(Vec<RouteEntry>),
     Unknown { code: u8, data: Vec<u8> },
 }
@@ -141,6 +152,7 @@ impl DhcpOption {
             DhcpOption::VendorClass(_) => OPT_VENDOR_CLASS,
             DhcpOption::ClientIdentifier(_) => OPT_CLIENT_IDENTIFIER,
             DhcpOption::RelayAgentInfo(_) => OPT_RELAY_AGENT_INFO,
+            DhcpOption::V6OnlyPreferred(_) => OPT_V6_ONLY_PREFERRED,
             DhcpOption::ClasslessStaticRoute(_) => OPT_CLASSLESS_STATIC_ROUTE,
             DhcpOption::Unknown { code, .. } => *code,
         }
@@ -204,6 +216,9 @@ impl DhcpOption {
             }
             DhcpOption::RelayAgentInfo(agent) => {
                 encode_option_82(buf, agent);
+            }
+            DhcpOption::V6OnlyPreferred(secs) => {
+                push_u32(buf, OPT_V6_ONLY_PREFERRED, *secs);
             }
             DhcpOption::ClasslessStaticRoute(entries) => {
                 encode_classless_routes(buf, entries);
@@ -358,6 +373,7 @@ fn decode_single(code: u8, body: &[u8]) -> Result<DhcpOption, DhcpdError> {
         OPT_VENDOR_CLASS => DhcpOption::VendorClass(body.to_vec()),
         OPT_CLIENT_IDENTIFIER => DhcpOption::ClientIdentifier(body.to_vec()),
         OPT_RELAY_AGENT_INFO => DhcpOption::RelayAgentInfo(decode_option_82(body)?),
+        OPT_V6_ONLY_PREFERRED => DhcpOption::V6OnlyPreferred(expect_u32(code, body)?),
         OPT_CLASSLESS_STATIC_ROUTE => {
             DhcpOption::ClasslessStaticRoute(decode_classless_routes(body)?)
         }
@@ -532,6 +548,23 @@ pub fn find_client_identifier(opts: &[DhcpOption]) -> Option<&[u8]> {
         DhcpOption::ClientIdentifier(b) => Some(b.as_slice()),
         _ => None,
     })
+}
+
+/// Look up the parameter-request-list option (55) raw codes.
+pub fn find_param_request_list(opts: &[DhcpOption]) -> Option<&[u8]> {
+    opts.iter().find_map(|o| match o {
+        DhcpOption::ParamRequestList(b) => Some(b.as_slice()),
+        _ => None,
+    })
+}
+
+/// True if the client signalled support for RFC 8925 IPv6-Only
+/// Preferred — i.e. the parameter-request-list (option 55) contains
+/// option code 108.
+pub fn client_requests_v6_only_preferred(opts: &[DhcpOption]) -> bool {
+    find_param_request_list(opts)
+        .map(|prl| prl.contains(&OPT_V6_ONLY_PREFERRED))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -712,6 +745,28 @@ mod tests {
         } else {
             panic!("expected unknown, got {:?}", decoded[0]);
         }
+    }
+
+    #[test]
+    fn v6_only_preferred_round_trips() {
+        let opt = DhcpOption::V6OnlyPreferred(1800);
+        let mut buf = Vec::new();
+        opt.encode(&mut buf);
+        // Wire shape: [108][4][0,0,7,8] (1800 == 0x0708).
+        assert_eq!(buf, vec![OPT_V6_ONLY_PREFERRED, 4, 0x00, 0x00, 0x07, 0x08]);
+        buf.push(OPT_END);
+        let decoded = decode_options(&buf).unwrap();
+        assert_eq!(decoded, vec![DhcpOption::V6OnlyPreferred(1800)]);
+    }
+
+    #[test]
+    fn client_requests_v6_only_via_prl() {
+        let with = vec![DhcpOption::ParamRequestList(vec![1, 3, 6, 108, 51])];
+        assert!(client_requests_v6_only_preferred(&with));
+        let without = vec![DhcpOption::ParamRequestList(vec![1, 3, 6, 51])];
+        assert!(!client_requests_v6_only_preferred(&without));
+        let no_prl: Vec<DhcpOption> = vec![DhcpOption::MessageType(1)];
+        assert!(!client_requests_v6_only_preferred(&no_prl));
     }
 
     #[test]

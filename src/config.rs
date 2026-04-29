@@ -100,6 +100,13 @@ pub struct Dhcp4SubnetRaw {
     pub domain_name: Option<String>,
     #[serde(default)]
     pub trust_relay: bool,
+    /// RFC 8925 V6ONLY_WAIT in seconds. When set, clients on this
+    /// subnet that signal option 108 in their PRL receive a
+    /// no-yiaddr DHCPOFFER carrying option 108 — they disable IPv4
+    /// for the configured duration. Clients that do NOT request
+    /// option 108 still get a normal IPv4 lease.
+    #[serde(default)]
+    pub v6_only_preferred: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -282,6 +289,10 @@ pub struct Subnet4 {
     pub dns_servers: Vec<Ipv4Addr>,
     pub domain_name: Option<String>,
     pub trust_relay: bool,
+    /// RFC 8925 V6ONLY_WAIT in seconds for clients on this subnet
+    /// that signal option 108 in their PRL. `None` disables the
+    /// behavior; clients always get a normal v4 lease.
+    pub v6_only_preferred: Option<u32>,
 }
 
 /// A parsed subnet entry for DHCPv6.
@@ -591,6 +602,22 @@ impl DhcpdConfig {
                 }
             };
             let dns_servers = parse_ipv4_list(&raw.dns_servers, "subnets[].dns_servers")?;
+            // RFC 8925 §3.5: clients clamp values < 300 to 300. Warn
+            // and clamp at config load so reply traffic is honest
+            // about what the client will actually do.
+            let v6_only_preferred = raw.v6_only_preferred.map(|secs| {
+                if secs < crate::packet::v4::options::MIN_V6ONLY_WAIT {
+                    tracing::warn!(
+                        subnet = %raw.subnet,
+                        configured = secs,
+                        clamped = crate::packet::v4::options::MIN_V6ONLY_WAIT,
+                        "v6_only_preferred below RFC 8925 minimum; clamping"
+                    );
+                    crate::packet::v4::options::MIN_V6ONLY_WAIT
+                } else {
+                    secs
+                }
+            });
             subnets.push(Subnet4 {
                 subnet,
                 pool_start,
@@ -600,6 +627,7 @@ impl DhcpdConfig {
                 dns_servers,
                 domain_name: raw.domain_name.clone(),
                 trust_relay: raw.trust_relay,
+                v6_only_preferred,
             });
         }
         // Duplicate-subnet guard (exact-match CIDR).

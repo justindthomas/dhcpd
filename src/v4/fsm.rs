@@ -30,7 +30,8 @@ use crate::packet::v4::client_id::ClientId;
 use crate::packet::v4::header::{BootOp, BootpHeader, BOOTP_FLAG_BROADCAST};
 use crate::packet::v4::message::{DhcpMessage, DhcpMessageType};
 use crate::packet::v4::options::{
-    find_client_identifier, find_option_82, find_requested_ip, find_server_id, DhcpOption,
+    client_requests_v6_only_preferred, find_client_identifier, find_option_82,
+    find_requested_ip, find_server_id, DhcpOption,
 };
 use crate::v4::allocator::{AllocateResult, Allocator};
 
@@ -158,6 +159,9 @@ fn select_effective_context(
         msg.header.giaddr
     };
     let subnet = global.find_subnet(selector)?;
+    // v6_only_preferred is read directly off the matched subnet by
+    // the v6-only short-circuit (see `find_v6_only_seconds`); we
+    // don't need to mirror it onto the synthesized iface.
     Some(InterfaceV4Config {
         name: format!("subnet:{}", subnet.subnet),
         // Server-ID / reply-source comes from the ingress iface —
@@ -187,6 +191,19 @@ fn handle_discover(
     store: &LeaseStoreV4,
     now: SystemTime,
 ) -> Result<FsmOutcome, DhcpdError> {
+    // RFC 8925: if the subnet is v6-only-preferred AND the client
+    // signaled support via PRL, OFFER with yiaddr=0 + option 108
+    // and skip allocation entirely (§3.1: "MUST NOT allocate").
+    if let Some(secs) = find_v6_only_seconds(msg, iface, global) {
+        tracing::info!(
+            cid = %cid.pretty(),
+            wait_secs = secs,
+            "DISCOVER: v6-only-preferred subnet; sending no-yiaddr OFFER with option 108"
+        );
+        let reply = build_v6_only_reply(msg, DhcpMessageType::Offer, iface, secs);
+        let tx = encode_tx(reply, &msg.header, rx_src_addr, iface, sw_if_index);
+        return Ok(FsmOutcome::Reply { tx, commit: None });
+    }
     let requested = find_requested_ip(&msg.options);
     let ip = match allocator.pick(cid, mac, requested, store) {
         AllocateResult::Available(ip) => ip,
@@ -272,6 +289,20 @@ fn handle_request(
                 "REQUEST (SELECTING) not for us; ignoring"
             );
             return Ok(FsmOutcome::Silent { commit: None });
+        }
+        // RFC 8925 §3.2: well-behaved v6-only clients shouldn't
+        // REQUEST after a no-yiaddr OFFER, but if one does we ACK
+        // with the same yiaddr=0 + option 108 shape so the client
+        // still picks up the V6ONLY_WAIT timer.
+        if let Some(secs) = find_v6_only_seconds(msg, iface, global) {
+            tracing::info!(
+                cid = %cid.pretty(),
+                wait_secs = secs,
+                "REQUEST (SELECTING): v6-only-preferred subnet; ACK with option 108 only"
+            );
+            let reply = build_v6_only_reply(msg, DhcpMessageType::Ack, iface, secs);
+            let tx = encode_tx(reply, &msg.header, rx_src_addr, iface, sw_if_index);
+            return Ok(FsmOutcome::Reply { tx, commit: None });
         }
         let ip = requested.unwrap();
         // Verify this is what the allocator would hand out now —
@@ -629,6 +660,74 @@ fn encode_tx(
         dst_mac,
         broadcast,
         payload,
+    }
+}
+
+/// RFC 8925: returns the configured V6ONLY_WAIT seconds when the
+/// client opted in via PRL (option 55 contains 108) AND a matching
+/// subnet has `v6_only_preferred` set. Selector follows the same
+/// rules as `select_effective_context`: relayed packets pick the
+/// subnet by `giaddr` (or option 82 link-selection when trusted);
+/// direct packets pick by the ingress interface's address.
+fn find_v6_only_seconds(
+    msg: &DhcpMessage,
+    iface: &InterfaceV4Config,
+    global: &DhcpdConfig,
+) -> Option<u32> {
+    if !client_requests_v6_only_preferred(&msg.options) {
+        return None;
+    }
+    let selector = if msg.header.giaddr.is_unspecified() {
+        iface.address
+    } else if iface.trust_relay {
+        find_option_82(&msg.options)
+            .and_then(|o| o.link_selection)
+            .unwrap_or(msg.header.giaddr)
+    } else {
+        msg.header.giaddr
+    };
+    global.find_subnet(selector).and_then(|s| s.v6_only_preferred)
+}
+
+/// Build a DHCPOFFER/DHCPACK carrying option 108 only — yiaddr is
+/// zero, no lease time, no subnet/router/DNS. RFC 8925 §3.1: the
+/// server MUST NOT allocate an IPv4 address when sending option 108
+/// for a v6-only network. Server-ID, client-id echo, and option 82
+/// echo follow the normal reply rules.
+fn build_v6_only_reply(
+    req: &DhcpMessage,
+    msg_type: DhcpMessageType,
+    iface: &InterfaceV4Config,
+    wait_secs: u32,
+) -> DhcpMessage {
+    let mut hdr = req.header.clone();
+    hdr.op = BootOp::Reply;
+    hdr.ciaddr = Ipv4Addr::UNSPECIFIED;
+    hdr.yiaddr = Ipv4Addr::UNSPECIFIED;
+    hdr.siaddr = Ipv4Addr::UNSPECIFIED;
+    hdr.sname = [0u8; 64];
+    hdr.file = [0u8; 128];
+
+    let agent = find_option_82(&req.options).cloned();
+    let server_id = agent
+        .as_ref()
+        .and_then(|a| a.server_id_override)
+        .unwrap_or(iface.address);
+    let mut opts: Vec<DhcpOption> = Vec::with_capacity(5);
+    opts.push(DhcpOption::MessageType(msg_type as u8));
+    opts.push(DhcpOption::ServerId(server_id));
+    opts.push(DhcpOption::V6OnlyPreferred(wait_secs));
+    if let Some(c) = find_client_identifier(&req.options) {
+        opts.push(DhcpOption::ClientIdentifier(c.to_vec()));
+    }
+    if let Some(a) = agent {
+        opts.push(DhcpOption::RelayAgentInfo(a));
+    }
+
+    DhcpMessage {
+        header: hdr,
+        msg_type,
+        options: opts,
     }
 }
 
@@ -1039,6 +1138,7 @@ mod tests {
             dns_servers: vec![Ipv4Addr::new(10, 0, 1, 1)],
             domain_name: Some("customer1".into()),
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();
@@ -1109,6 +1209,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         global.subnets.push(crate::config::Subnet4 {
             subnet: "10.0.99.0/24".parse().unwrap(),
@@ -1119,6 +1220,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();
@@ -1157,6 +1259,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         global.subnets.push(crate::config::Subnet4 {
             subnet: "10.0.99.0/24".parse().unwrap(),
@@ -1167,6 +1270,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();
@@ -1246,6 +1350,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();
@@ -1280,6 +1385,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();
@@ -1309,6 +1415,229 @@ mod tests {
     }
 
     #[test]
+    fn v6_only_subnet_with_prl_108_offers_no_yiaddr_with_option_108() {
+        // Direct-broadcast: ingress iface 10.0.0.1/24 sits inside a
+        // subnet flagged v6_only_preferred = 1800. Client sends
+        // DISCOVER with PRL containing 108 → expect OFFER with
+        // yiaddr=0.0.0.0 and option 108 = 1800, and no lease commit.
+        let iface = mk_iface([10, 0, 0, 1], [10, 0, 0, 100], [10, 0, 0, 110]);
+        let mut global = mk_global();
+        global.subnets.push(crate::config::Subnet4 {
+            subnet: "10.0.0.0/24".parse().unwrap(),
+            pool_start: Ipv4Addr::new(10, 0, 0, 100),
+            pool_end: Ipv4Addr::new(10, 0, 0, 110),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            lease_time: None,
+            dns_servers: vec![],
+            domain_name: None,
+            trust_relay: false,
+            v6_only_preferred: Some(1800),
+        });
+        let dir = tempdir().unwrap();
+        let store = LeaseStoreV4::open(dir.path()).unwrap();
+
+        let mut msg = mk_discover([0xaa; 6], 0xfeed);
+        msg.options
+            .push(DhcpOption::ParamRequestList(vec![1, 3, 6, 108]));
+
+        let outcome = handle(
+            &msg,
+            2,
+            Ipv4Addr::UNSPECIFIED,
+            &iface,
+            &global,
+            &store,
+            SystemTime::now(),
+        )
+        .unwrap();
+        match outcome {
+            FsmOutcome::Reply { tx, commit: None } => {
+                let reply = DhcpMessage::decode(&tx.payload).unwrap();
+                assert_eq!(reply.msg_type, DhcpMessageType::Offer);
+                assert_eq!(reply.header.yiaddr, Ipv4Addr::UNSPECIFIED);
+                let secs = reply
+                    .options
+                    .iter()
+                    .find_map(|o| match o {
+                        DhcpOption::V6OnlyPreferred(s) => Some(*s),
+                        _ => None,
+                    })
+                    .expect("option 108 in reply");
+                assert_eq!(secs, 1800);
+                // Lease store untouched.
+                assert_eq!(store.len(), 0);
+                // Server-ID still our address so the client can match
+                // any later messages it may send.
+                assert_eq!(
+                    find_server_id(&reply.options),
+                    Some(Ipv4Addr::new(10, 0, 0, 1))
+                );
+            }
+            other => panic!("expected v6-only OFFER, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v6_only_subnet_without_prl_108_falls_through_to_normal_offer() {
+        // Same v6-only subnet as above, but the client doesn't list
+        // 108 in its PRL — fall back to a normal v4 lease.
+        let iface = mk_iface([10, 0, 0, 1], [10, 0, 0, 100], [10, 0, 0, 110]);
+        let mut global = mk_global();
+        global.subnets.push(crate::config::Subnet4 {
+            subnet: "10.0.0.0/24".parse().unwrap(),
+            pool_start: Ipv4Addr::new(10, 0, 0, 100),
+            pool_end: Ipv4Addr::new(10, 0, 0, 110),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            lease_time: None,
+            dns_servers: vec![],
+            domain_name: None,
+            trust_relay: false,
+            v6_only_preferred: Some(1800),
+        });
+        let dir = tempdir().unwrap();
+        let store = LeaseStoreV4::open(dir.path()).unwrap();
+
+        let mut msg = mk_discover([0xbb; 6], 0xbeef);
+        // PRL without 108 — legacy v4 client.
+        msg.options
+            .push(DhcpOption::ParamRequestList(vec![1, 3, 6, 51]));
+
+        let outcome = handle(
+            &msg,
+            2,
+            Ipv4Addr::UNSPECIFIED,
+            &iface,
+            &global,
+            &store,
+            SystemTime::now(),
+        )
+        .unwrap();
+        match outcome {
+            FsmOutcome::Reply {
+                tx,
+                commit: Some(LeaseMutation::Bind(_)),
+            } => {
+                let reply = DhcpMessage::decode(&tx.payload).unwrap();
+                assert_eq!(reply.msg_type, DhcpMessageType::Offer);
+                assert_eq!(reply.header.yiaddr, Ipv4Addr::new(10, 0, 0, 100));
+                assert!(!reply
+                    .options
+                    .iter()
+                    .any(|o| matches!(o, DhcpOption::V6OnlyPreferred(_))));
+            }
+            other => panic!("expected normal Offer+Bind, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v6_only_relayed_discover_uses_giaddr_subnet() {
+        // Relayed: ingress iface is 172.16.0.2 (uplink); the relayed
+        // DISCOVER carries giaddr=192.168.20.5 inside a v6-only
+        // subnet. Reply should be no-yiaddr ACK with option 108 and
+        // route back to the relay (giaddr) on port 67.
+        let iface = mk_iface([172, 16, 0, 2], [172, 16, 0, 100], [172, 16, 0, 110]);
+        let mut global = mk_global();
+        global.subnets.push(crate::config::Subnet4 {
+            subnet: "192.168.20.0/24".parse().unwrap(),
+            pool_start: Ipv4Addr::new(192, 168, 20, 100),
+            pool_end: Ipv4Addr::new(192, 168, 20, 200),
+            gateway: Ipv4Addr::new(192, 168, 20, 1),
+            lease_time: None,
+            dns_servers: vec![],
+            domain_name: None,
+            trust_relay: false,
+            v6_only_preferred: Some(600),
+        });
+        let dir = tempdir().unwrap();
+        let store = LeaseStoreV4::open(dir.path()).unwrap();
+
+        let mut msg = mk_discover([0xcc; 6], 0x1234);
+        msg.header.giaddr = Ipv4Addr::new(192, 168, 20, 5);
+        msg.options
+            .push(DhcpOption::ParamRequestList(vec![1, 3, 6, 108]));
+
+        let outcome = handle(
+            &msg,
+            2,
+            Ipv4Addr::UNSPECIFIED,
+            &iface,
+            &global,
+            &store,
+            SystemTime::now(),
+        )
+        .unwrap();
+        match outcome {
+            FsmOutcome::Reply { tx, commit: None } => {
+                assert_eq!(tx.dst_addr, Ipv4Addr::new(192, 168, 20, 5));
+                assert_eq!(tx.dst_port, 67);
+                let reply = DhcpMessage::decode(&tx.payload).unwrap();
+                assert_eq!(reply.header.yiaddr, Ipv4Addr::UNSPECIFIED);
+                let secs = reply
+                    .options
+                    .iter()
+                    .find_map(|o| match o {
+                        DhcpOption::V6OnlyPreferred(s) => Some(*s),
+                        _ => None,
+                    })
+                    .expect("option 108 in reply");
+                assert_eq!(secs, 600);
+            }
+            other => panic!("expected relayed v6-only OFFER, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v6_only_selecting_request_acks_with_option_108() {
+        let iface = mk_iface([10, 0, 0, 1], [10, 0, 0, 100], [10, 0, 0, 110]);
+        let mut global = mk_global();
+        global.subnets.push(crate::config::Subnet4 {
+            subnet: "10.0.0.0/24".parse().unwrap(),
+            pool_start: Ipv4Addr::new(10, 0, 0, 100),
+            pool_end: Ipv4Addr::new(10, 0, 0, 110),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            lease_time: None,
+            dns_servers: vec![],
+            domain_name: None,
+            trust_relay: false,
+            v6_only_preferred: Some(900),
+        });
+        let dir = tempdir().unwrap();
+        let store = LeaseStoreV4::open(dir.path()).unwrap();
+
+        let mut req = mk_request_selecting(
+            [0xdd; 6],
+            1,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 100),
+        );
+        req.options
+            .push(DhcpOption::ParamRequestList(vec![1, 3, 6, 108]));
+
+        let outcome = handle(
+            &req,
+            2,
+            Ipv4Addr::UNSPECIFIED,
+            &iface,
+            &global,
+            &store,
+            SystemTime::now(),
+        )
+        .unwrap();
+        match outcome {
+            FsmOutcome::Reply { tx, commit: None } => {
+                let reply = DhcpMessage::decode(&tx.payload).unwrap();
+                assert_eq!(reply.msg_type, DhcpMessageType::Ack);
+                assert_eq!(reply.header.yiaddr, Ipv4Addr::UNSPECIFIED);
+                assert!(reply
+                    .options
+                    .iter()
+                    .any(|o| matches!(o, DhcpOption::V6OnlyPreferred(900))));
+            }
+            other => panic!("expected v6-only ACK, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn relayed_reply_falls_back_to_giaddr_when_rx_src_unspecified() {
         // Backwards-compat: if the caller doesn't thread through a
         // real packet source (rx_src=0.0.0.0), use giaddr per RFC
@@ -1325,6 +1654,7 @@ mod tests {
             dns_servers: vec![],
             domain_name: None,
             trust_relay: false,
+            v6_only_preferred: None,
         });
         let dir = tempdir().unwrap();
         let store = LeaseStoreV4::open(dir.path()).unwrap();

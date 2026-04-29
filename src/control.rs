@@ -33,6 +33,9 @@ pub enum ControlRequest {
     Interfaces,
     Leases,
     Pools,
+    /// `dhcp_server.subnets[]` view — pool, gateway, options,
+    /// `v6_only_preferred` (RFC 8925).
+    Subnets,
     /// Admin-initiated release — frees the lease for `client_id`.
     /// `client_id` is hex-encoded (lowercase, ':'-separated bytes
     /// or tight hex) to avoid embedding raw bytes in JSON strings.
@@ -47,6 +50,7 @@ pub enum ControlResponse {
     Interfaces(InterfacesReply),
     Leases(LeasesReply),
     Pools(PoolsReply),
+    Subnets(SubnetsReply),
     ReleaseLease(ReleaseReply),
     Leases6(Leases6Reply),
     Error { error: String },
@@ -95,6 +99,11 @@ pub struct InterfaceStatus {
     pub v6_pool: Option<PoolRange6>,
     /// PD pool name referenced by v6 serving on this interface, if any.
     pub v6_pd_pool: Option<String>,
+    /// V6ONLY_WAIT seconds (RFC 8925, option 108) inherited from the
+    /// matching `dhcp_server.subnets[]` entry that contains this
+    /// interface's IPv4 address. `None` when no subnet covers it or
+    /// the subnet doesn't opt in.
+    pub v6_only_preferred: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +152,26 @@ pub struct PoolRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetsReply {
+    pub subnets: Vec<SubnetRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetRow {
+    pub subnet: String,
+    pub pool_start: String,
+    pub pool_end: String,
+    pub gateway: String,
+    pub lease_time: Option<u32>,
+    pub dns_servers: Vec<String>,
+    pub domain_name: Option<String>,
+    pub trust_relay: bool,
+    /// V6ONLY_WAIT seconds (RFC 8925, option 108). `None` disables
+    /// the v6-only short-circuit for clients on this subnet.
+    pub v6_only_preferred: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseReply {
     pub ok: bool,
     pub message: String,
@@ -182,6 +211,12 @@ pub struct ControlSnapshot {
     pub v6_enabled: bool,
     pub interfaces: Vec<IoInterface>,
     pub v4_iface_configs: Vec<crate::config::InterfaceV4Config>,
+    /// Snapshot of `dhcp_server.subnets[]`. Refreshed at startup and
+    /// on SIGHUP reload — the v4 server's live `global.subnets` is
+    /// the source of truth, but this mirror lets the `Interfaces`
+    /// query surface per-interface `v6_only_preferred` without
+    /// taking a v4_server lock.
+    pub v4_subnets: Vec<crate::config::Subnet4>,
     pub v6_iface_configs: Vec<crate::config::InterfaceV6Config>,
     pub pd_pool_count: usize,
     pub reservation_count: usize,
@@ -201,6 +236,7 @@ impl Default for ControlSnapshot {
             v6_enabled: false,
             interfaces: Vec::new(),
             v4_iface_configs: Vec::new(),
+            v4_subnets: Vec::new(),
             v6_iface_configs: Vec::new(),
             v4_relay_interface_names: Vec::new(),
             pd_pool_count: 0,
@@ -306,6 +342,26 @@ async fn handle_request(
                 })
                 .collect();
             ControlResponse::Leases(LeasesReply { leases })
+        }
+        ControlRequest::Subnets => {
+            // Read straight off the snapshot mirror — same shape the
+            // FSM consults at packet time. No v4_server lock needed.
+            let subnets = snap
+                .v4_subnets
+                .iter()
+                .map(|s| SubnetRow {
+                    subnet: s.subnet.to_string(),
+                    pool_start: s.pool_start.to_string(),
+                    pool_end: s.pool_end.to_string(),
+                    gateway: s.gateway.to_string(),
+                    lease_time: s.lease_time,
+                    dns_servers: s.dns_servers.iter().map(|a| a.to_string()).collect(),
+                    domain_name: s.domain_name.clone(),
+                    trust_relay: s.trust_relay,
+                    v6_only_preferred: s.v6_only_preferred,
+                })
+                .collect();
+            ControlResponse::Subnets(SubnetsReply { subnets })
         }
         ControlRequest::Pools => {
             let Some(srv) = snap.v4_server.clone() else {
@@ -469,6 +525,17 @@ fn build_iface_status(iface: &IoInterface, snap: &ControlSnapshot) -> InterfaceS
         _ => None,
     });
     let v6_pd_pool = v6_cfg.and_then(|c| c.pd_pool.clone());
+    // RFC 8925: when a configured subnet contains the iface's IPv4
+    // address and has `v6_only_preferred`, surface it here so an
+    // operator running `dhcpd query interfaces` sees the v6-only
+    // policy without having to cross-reference the subnets list.
+    let v6_only_preferred = iface.ipv4_address.and_then(|addr| {
+        snap.v4_subnets
+            .iter()
+            .filter(|s| s.subnet.contains(&addr))
+            .max_by_key(|s| s.subnet.prefix_len())
+            .and_then(|s| s.v6_only_preferred)
+    });
     InterfaceStatus {
         name: iface.name.clone(),
         sw_if_index: iface.sw_if_index,
@@ -491,6 +558,7 @@ fn build_iface_status(iface: &IoInterface, snap: &ControlSnapshot) -> InterfaceS
             .any(|n| n == &iface.name),
         v6_pool,
         v6_pd_pool,
+        v6_only_preferred,
     }
 }
 
@@ -529,6 +597,34 @@ mod tests {
         assert_eq!(s, "{\"command\":\"status\"}");
         let s = serde_json::to_string(&ControlRequest::Interfaces).unwrap();
         assert_eq!(s, "{\"command\":\"interfaces\"}");
+        let s = serde_json::to_string(&ControlRequest::Subnets).unwrap();
+        assert_eq!(s, "{\"command\":\"subnets\"}");
+    }
+
+    #[test]
+    fn subnets_reply_round_trip() {
+        let r = ControlResponse::Subnets(SubnetsReply {
+            subnets: vec![SubnetRow {
+                subnet: "10.0.20.0/24".into(),
+                pool_start: "10.0.20.100".into(),
+                pool_end: "10.0.20.200".into(),
+                gateway: "10.0.20.1".into(),
+                lease_time: Some(7200),
+                dns_servers: vec!["10.0.20.1".into()],
+                domain_name: Some("v6only.example".into()),
+                trust_relay: false,
+                v6_only_preferred: Some(1800),
+            }],
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ControlResponse = serde_json::from_str(&s).unwrap();
+        match back {
+            ControlResponse::Subnets(reply) => {
+                assert_eq!(reply.subnets.len(), 1);
+                assert_eq!(reply.subnets[0].v6_only_preferred, Some(1800));
+            }
+            other => panic!("expected Subnets, got {:?}", other),
+        }
     }
 
     #[test]

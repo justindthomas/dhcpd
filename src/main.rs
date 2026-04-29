@@ -79,7 +79,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          [--lease-db DIR] [--io punt|raw]"
     );
     eprintln!(
-        "  dhcpd query <status|interfaces|leases|pools|release-lease> \
+        "  dhcpd query <status|interfaces|leases|pools|subnets|release-lease> \
          [-o text|json] [--control-socket PATH] [--client-id MAC]"
     );
     std::process::exit(code);
@@ -141,7 +141,9 @@ fn parse_args() -> Command {
 
 fn parse_query_args<I: Iterator<Item = String>>(mut args: I) -> QueryArgs {
     let subject = args.next().unwrap_or_else(|| {
-        eprintln!("query requires a subject (status, interfaces, leases, pools, release-lease)");
+        eprintln!(
+            "query requires a subject (status, interfaces, leases, pools, subnets, release-lease)"
+        );
         print_usage_and_exit(1);
     });
 
@@ -180,6 +182,7 @@ fn parse_query_args<I: Iterator<Item = String>>(mut args: I) -> QueryArgs {
         "leases" => ControlRequest::Leases,
         "leases6" => ControlRequest::Leases6,
         "pools" => ControlRequest::Pools,
+        "subnets" => ControlRequest::Subnets,
         "release-lease" => {
             let cid = client_id.unwrap_or_else(|| {
                 eprintln!("release-lease requires --client-id");
@@ -303,8 +306,8 @@ fn print_response(resp: &ControlResponse) {
                 return;
             }
             println!(
-                "{:<12} {:<4} {:<17} {:<18} {:<28} {:<8} {}",
-                "Name", "idx", "MAC", "IPv4", "Pool", "PD", "LinkLocal"
+                "{:<12} {:<4} {:<17} {:<18} {:<28} {:<8} {:<10} {}",
+                "Name", "idx", "MAC", "IPv4", "Pool", "PD", "V6Only", "LinkLocal"
             );
             for i in &r.interfaces {
                 let addr = i
@@ -318,10 +321,50 @@ fn print_response(resp: &ControlResponse) {
                     (None, false) => "-".into(),
                 };
                 let pd = i.v6_pd_pool.clone().unwrap_or_else(|| "-".into());
+                let v6only = i
+                    .v6_only_preferred
+                    .map(|s| format!("{}s", s))
+                    .unwrap_or_else(|| "-".into());
                 let ll = i.ipv6_link_local.clone().unwrap_or_else(|| "-".into());
                 println!(
-                    "{:<12} {:<4} {:<17} {:<18} {:<28} {:<8} {}",
-                    i.name, i.sw_if_index, i.mac_address, addr, pool, pd, ll
+                    "{:<12} {:<4} {:<17} {:<18} {:<28} {:<8} {:<10} {}",
+                    i.name, i.sw_if_index, i.mac_address, addr, pool, pd, v6only, ll
+                );
+            }
+        }
+        ControlResponse::Subnets(r) => {
+            if r.subnets.is_empty() {
+                println!("No subnets.");
+                return;
+            }
+            println!(
+                "{:<18} {:<16} {:<16} {:<14} {:<8} {:<6} {:<8} {}",
+                "Subnet", "Pool start", "Pool end", "Gateway", "Lease", "Trust", "V6Only", "DNS"
+            );
+            for s in &r.subnets {
+                let lease = s
+                    .lease_time
+                    .map(|t| format!("{}s", t))
+                    .unwrap_or_else(|| "-".into());
+                let v6only = s
+                    .v6_only_preferred
+                    .map(|t| format!("{}s", t))
+                    .unwrap_or_else(|| "-".into());
+                let dns = if s.dns_servers.is_empty() {
+                    "-".into()
+                } else {
+                    s.dns_servers.join(",")
+                };
+                println!(
+                    "{:<18} {:<16} {:<16} {:<14} {:<8} {:<6} {:<8} {}",
+                    s.subnet,
+                    s.pool_start,
+                    s.pool_end,
+                    s.gateway,
+                    lease,
+                    if s.trust_relay { "yes" } else { "no" },
+                    v6only,
+                    dns,
                 );
             }
         }
@@ -664,6 +707,10 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             .as_ref()
             .map(|c| c.interfaces.clone())
             .unwrap_or_default(),
+        v4_subnets: v4_cfg
+            .as_ref()
+            .map(|c| c.subnets.clone())
+            .unwrap_or_default(),
         v4_relay_interface_names: v4_cfg
             .as_ref()
             .map(|c| c.enabled_interfaces.clone())
@@ -939,6 +986,10 @@ async fn reload_config(
         s.v4_iface_configs = new_v4
             .as_ref()
             .map(|c| c.interfaces.clone())
+            .unwrap_or_default();
+        s.v4_subnets = new_v4
+            .as_ref()
+            .map(|c| c.subnets.clone())
             .unwrap_or_default();
         s.v4_relay_interface_names = new_v4
             .as_ref()

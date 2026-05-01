@@ -174,17 +174,6 @@ pub struct Ipv4AddressConfig {
     pub prefix: u8,
 }
 
-/// An IPv4 address on a loopback (uses cidr field).
-#[derive(Debug, Default, Deserialize, Clone)]
-pub struct Ipv4CidrConfig {
-    #[serde(default)]
-    pub address: Option<String>,
-    #[serde(default)]
-    pub cidr: Option<String>,
-    #[serde(default)]
-    pub prefix: Option<u8>,
-}
-
 /// Sub-interface (DHCP-relevant fields).
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct InterfaceConfig {
@@ -213,13 +202,24 @@ pub struct InterfaceConfig {
 }
 
 /// Loopback interface (DHCP-relevant fields — none today; loopbacks
-/// don't serve DHCP, but we keep the type so the deserializer is
-/// symmetric and future-proof for e.g. info-request-only listeners).
+/// don't serve DHCP, but we keep the type so the deserializer
+/// swallows the `loopbacks:` section without choking. Field shapes
+/// mirror impd's canonical `LoopbackInterface` schema (scalar
+/// `Option<String>` ipv4/ipv6 + scalar `Option<i32>` prefixes) so
+/// the daemons agree on one form. The values themselves are
+/// ignored — dhcpd doesn't bind, listen, or serve on loopback
+/// addresses today.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct LoopbackConfig {
     pub name: Option<String>,
     #[serde(default)]
-    pub ipv4: Vec<Ipv4CidrConfig>,
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<i32>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_prefix: Option<i32>,
 }
 
 /// Parsed, validated per-interface DHCPv4 server configuration.

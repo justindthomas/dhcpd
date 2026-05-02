@@ -342,6 +342,25 @@ fn handle_request(
             }
         }
     } else if is_init_reboot {
+        // RFC 8925 §3: if the subnet is v6-only-preferred AND the
+        // client signaled support via PRL, ACK with yiaddr=0 +
+        // option 108 even on INIT-REBOOT — the spec doesn't carve
+        // out the rebinding states, and a Mac (or any well-behaved
+        // dual-stack client) that signals 108 should pick up the
+        // V6ONLY_WAIT timer regardless of which DHCP-state phase
+        // it's in. Without this short-circuit, a client whose
+        // previous lease pre-dated the v6-only-preferred config
+        // would just keep INIT-REBOOTing into its old IP forever.
+        if let Some(secs) = find_v6_only_seconds(msg, iface, global) {
+            tracing::info!(
+                cid = %cid.pretty(),
+                wait_secs = secs,
+                "REQUEST (INIT-REBOOT): v6-only-preferred subnet; ACK with option 108 only"
+            );
+            let reply = build_v6_only_reply(msg, DhcpMessageType::Ack, iface, secs);
+            let tx = encode_tx(reply, &msg.header, rx_src_addr, iface, sw_if_index);
+            return Ok(FsmOutcome::Reply { tx, commit: None });
+        }
         // Client is reclaiming a known binding. If we have a lease
         // for this client matching the requested IP, ACK it;
         // otherwise NAK so the client falls back to DISCOVER.
@@ -416,6 +435,24 @@ fn handle_request(
             }
         }
     } else if is_renewing {
+        // RFC 8925 §3.2: a server which is configured to enable
+        // IPv6-only Preferred receiving a DHCPREQUEST in the
+        // RENEWING or REBINDING states from a client that includes
+        // option 108 in its PRL "MUST send a DHCPACK without
+        // yiaddr or any other IPv4 configuration parameters
+        // except for V6ONLY_WAIT". This is the explicit RFC mandate
+        // — the INIT-REBOOT short-circuit above is a defensive
+        // mirror of the same idea.
+        if let Some(secs) = find_v6_only_seconds(msg, iface, global) {
+            tracing::info!(
+                cid = %cid.pretty(),
+                wait_secs = secs,
+                "REQUEST (RENEWING): v6-only-preferred subnet; ACK with option 108 only (RFC 8925 §3.2)"
+            );
+            let reply = build_v6_only_reply(msg, DhcpMessageType::Ack, iface, secs);
+            let tx = encode_tx(reply, &msg.header, rx_src_addr, iface, sw_if_index);
+            return Ok(FsmOutcome::Reply { tx, commit: None });
+        }
         let ip = msg.header.ciaddr;
         match store.get(cid) {
             Some(existing) if existing.ip == ip => {

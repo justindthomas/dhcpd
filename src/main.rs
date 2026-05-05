@@ -539,11 +539,25 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Connect to VPP + discover interfaces.
+    // Connect to VPP via the supervisor — survives VPP being slow to
+    // come up at boot. dhcpd holds VPP-bound state (punt-socket
+    // registrations keyed on sw_if_index) so the simplest correct
+    // recovery on a VPP restart is to exit and let systemd restart
+    // us. The lifecycle watcher below does that.
     tracing::info!(socket = %args.vpp_api_socket, "connecting to VPP");
-    let vpp = vpp_api::VppClient::connect(&args.vpp_api_socket)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect to VPP {}: {}", args.vpp_api_socket, e))?;
+    let vpp_supervisor = vpp_api::VppSupervisor::spawn(args.vpp_api_socket.clone());
+    let vpp = vpp_supervisor.wait_ready().await;
+    {
+        let mut lifecycle = vpp_supervisor.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = lifecycle.recv().await {
+                if matches!(ev, vpp_api::VppLifecycle::Disconnected) {
+                    tracing::error!("VPP connection lost — exiting so systemd restarts dhcpd");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
     let interfaces = vpp_iface::discover(&vpp, &wanted_names).await?;
     if interfaces.is_empty() {
         anyhow::bail!(

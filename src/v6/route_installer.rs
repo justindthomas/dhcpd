@@ -139,6 +139,10 @@ fn build_pd_grant_route(event: &PdGranted) -> Route {
         metric: 0,
         tag: 0,
         admin_distance: None,
+        // dhcpd is single-VRF for now; per-VRF DHCP servers in
+        // Phase 2 will set this from the receiving interface's
+        // VRF assignment.
+        table_id: 0,
     }
 }
 
@@ -155,6 +159,7 @@ fn build_pd_revoke_route(event: &PdRevoked) -> Route {
         metric: 0,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     }
 }
 

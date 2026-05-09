@@ -1,0 +1,45 @@
+[package]
+name = "dhcpd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.dhcpd]
+path = ".."
+# dhcpd has no Cargo features today, so default deps are fine. Path-dep
+# `[patch]` entries in ../Cargo.toml propagate through this dep, so the
+# vpp-api / ribd / vcl-rs sibling overrides apply automatically.
+
+[[bin]]
+name = "parse_v4_message"
+path = "fuzz_targets/parse_v4_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v4_options"
+path = "fuzz_targets/parse_v4_options.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v6_message"
+path = "fuzz_targets/parse_v6_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v6_options"
+path = "fuzz_targets/parse_v6_options.rs"
+test = false
+doc = false
+bench = false

@@ -237,8 +237,21 @@ fn push_ip(buf: &mut Vec<u8>, code: u8, a: &Ipv4Addr) {
 }
 
 fn push_ip_list(buf: &mut Vec<u8>, code: u8, list: &[Ipv4Addr]) {
+    // DHCPv4 TLV length is a single byte; an IP list with > 63 entries
+    // (= 252 bytes) cannot fit. Truncate rather than wrap silently —
+    // a wrap would render the option unparseable to the client.
+    let mut list = list;
+    if list.len() > 63 {
+        tracing::warn!(
+            code,
+            requested = list.len(),
+            "option ip-list exceeds 63 entries (u8 length); truncating"
+        );
+        list = &list[..63];
+    }
+    let len = (list.len() * 4) as u8;
     buf.push(code);
-    buf.push((list.len() * 4) as u8);
+    buf.push(len);
     for a in list {
         buf.extend_from_slice(&a.octets());
     }
@@ -249,9 +262,30 @@ fn push_string(buf: &mut Vec<u8>, code: u8, s: &str) {
 }
 
 fn push_bytes(buf: &mut Vec<u8>, code: u8, b: &[u8]) {
+    let Ok(len) = u8::try_from(b.len()) else {
+        tracing::warn!(code, body_len = b.len(), "option body exceeds 255 bytes; dropping");
+        return;
+    };
     buf.push(code);
-    buf.push(b.len() as u8);
+    buf.push(len);
     buf.extend_from_slice(b);
+}
+
+/// Push an Option 82 sub-option `[code:1][len:1][body:len]` into `buf`,
+/// dropping the sub-option if its body exceeds the 255-byte u8 length
+/// limit rather than emitting a structurally malformed TLV.
+fn push_suboption(buf: &mut Vec<u8>, sub_code: u8, body: &[u8]) {
+    let Ok(len) = u8::try_from(body.len()) else {
+        tracing::warn!(
+            sub_code,
+            body_len = body.len(),
+            "option 82 sub-option body exceeds 255 bytes; dropping"
+        );
+        return;
+    };
+    buf.push(sub_code);
+    buf.push(len);
+    buf.extend_from_slice(body);
 }
 
 fn push_u32(buf: &mut Vec<u8>, code: u8, v: u32) {
@@ -267,14 +301,10 @@ fn encode_option_82(buf: &mut Vec<u8>, agent: &Option82) {
     // the parser are taken from `raw` so we round-trip opaque data.
     let mut body: Vec<u8> = Vec::new();
     if let Some(ci) = &agent.circuit_id {
-        body.push(SUBOPT_CIRCUIT_ID);
-        body.push(ci.len() as u8);
-        body.extend_from_slice(ci);
+        push_suboption(&mut body, SUBOPT_CIRCUIT_ID, ci);
     }
     if let Some(ri) = &agent.remote_id {
-        body.push(SUBOPT_REMOTE_ID);
-        body.push(ri.len() as u8);
-        body.extend_from_slice(ri);
+        push_suboption(&mut body, SUBOPT_REMOTE_ID, ri);
     }
     if let Some(ls) = agent.link_selection {
         body.push(SUBOPT_LINK_SELECTION);
@@ -452,7 +482,7 @@ fn decode_option_82(body: &[u8]) -> Result<Option82, DhcpdError> {
                 // Preserve unknown sub-options as raw bytes so
                 // encode_option_82 can echo them back unchanged.
                 raw.push(code);
-                raw.push(len as u8);
+                raw.push(body[i + 1]);
                 raw.extend_from_slice(sub_body);
             }
         }

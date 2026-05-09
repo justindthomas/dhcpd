@@ -1,6 +1,6 @@
 //! DHCP lease store.
 //!
-//! v1: append-only bincode journal (`leases-v4.journal`) with a
+//! v1: append-only postcard journal (`leases-v4.journal`) with a
 //! periodic snapshot (`leases-v4.snapshot`). On startup the daemon
 //! loads the snapshot then replays any journal entries recorded
 //! after it. Every mutation fsyncs the journal before returning.

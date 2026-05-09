@@ -3,7 +3,7 @@
 //! On-disk layout under `<lease_db_dir>`:
 //!
 //! ```text
-//! leases-v4.snapshot   # LeaseSet serialized with bincode (periodically rewritten)
+//! leases-v4.snapshot   # LeaseSet serialized with postcard (periodically rewritten)
 //! leases-v4.journal    # sequence of JournalEntry records, each length-prefixed u32 BE
 //! ```
 //!
@@ -127,7 +127,7 @@ impl LeaseStoreV4 {
         if snapshot_path.exists() {
             let bytes = std::fs::read(&snapshot_path)
                 .map_err(|e| DhcpdError::Lease(format!("read snapshot: {}", e)))?;
-            let set: LeaseSet = bincode::deserialize(&bytes)
+            let set: LeaseSet = postcard::from_bytes(&bytes)
                 .map_err(|e| DhcpdError::Lease(format!("decode snapshot: {}", e)))?;
             for lease in set.entries {
                 by_ip.insert(lease.ip, lease.client_id.clone());
@@ -270,7 +270,7 @@ impl LeaseStoreV4 {
         let set = LeaseSet {
             entries: self.by_client.values().cloned().collect(),
         };
-        let bytes = bincode::serialize(&set)
+        let bytes = postcard::to_stdvec(&set)
             .map_err(|e| DhcpdError::Lease(format!("encode snapshot: {}", e)))?;
         let tmp_path = self.snapshot_path.with_extension("snapshot.tmp");
         {
@@ -308,7 +308,7 @@ impl LeaseStoreV4 {
     }
 
     fn append(&mut self, entry: &JournalEntry) -> Result<(), DhcpdError> {
-        let bytes = bincode::serialize(entry)
+        let bytes = postcard::to_stdvec(entry)
             .map_err(|e| DhcpdError::Lease(format!("encode journal entry: {}", e)))?;
         let len = bytes.len() as u32;
         self.journal
@@ -358,7 +358,7 @@ fn replay_journal(
             break;
         }
         consumed += 4 + entry_len as u64;
-        let entry: JournalEntry = match bincode::deserialize(&body) {
+        let entry: JournalEntry = match postcard::from_bytes(&body) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(error = %e, "skipping undecodable journal entry");

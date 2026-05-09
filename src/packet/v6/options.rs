@@ -229,8 +229,12 @@ impl Dhcp6Option {
 }
 
 fn encode_raw(buf: &mut Vec<u8>, code: u16, body: &[u8]) {
+    // RFC 8415 §21.1 fixes the option length field at u16; a body
+    // exceeding 65535 bytes is a caller bug (UDP itself caps at ~64 KB).
+    let len = u16::try_from(body.len())
+        .expect("DHCPv6 option body must be <= 65535 bytes");
     buf.extend_from_slice(&code.to_be_bytes());
-    buf.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(body);
 }
 

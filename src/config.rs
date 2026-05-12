@@ -212,14 +212,13 @@ pub struct InterfaceConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct LoopbackConfig {
     pub name: Option<String>,
+    /// Address lists; deserialized but unused — dhcpd doesn't bind,
+    /// listen, or serve on loopback addresses today. Kept as
+    /// `serde_yaml::Value` so any shape impd writes round-trips.
     #[serde(default)]
-    pub ipv4: Option<String>,
+    pub ipv4: serde_yaml::Value,
     #[serde(default)]
-    pub ipv4_prefix: Option<i32>,
-    #[serde(default)]
-    pub ipv6: Option<String>,
-    #[serde(default)]
-    pub ipv6_prefix: Option<i32>,
+    pub ipv6: serde_yaml::Value,
 }
 
 /// Parsed, validated per-interface DHCPv4 server configuration.

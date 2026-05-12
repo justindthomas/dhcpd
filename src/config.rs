@@ -167,11 +167,38 @@ pub struct Dhcp6PdPool {
     pub valid_lifetime: Option<u32>,
 }
 
-/// An IPv4 address on a sub-interface.
-#[derive(Debug, Default, Deserialize, Clone)]
-pub struct Ipv4AddressConfig {
-    pub address: String,
-    pub prefix: u8,
+/// An IPv4 address on a sub-interface. impd writes a CIDR string
+/// today; the legacy `{address, prefix}` map is also accepted via the
+/// untagged enum so existing yaml round-trips. Mirrors the pattern
+/// ospfd's `Ipv4AddressConfig` uses (commit 64a6005 in that repo) —
+/// keeping the daemon-side schemas aligned so any impd serializer
+/// shape lands cleanly across the routing stack.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Ipv4AddressConfig {
+    Cidr(String),
+    Split { address: String, prefix: u8 },
+}
+
+impl Default for Ipv4AddressConfig {
+    fn default() -> Self {
+        Ipv4AddressConfig::Cidr(String::new())
+    }
+}
+
+impl Ipv4AddressConfig {
+    /// Parse into (address, prefix). Returns None when the CIDR
+    /// string is malformed.
+    pub fn as_pair(&self) -> Option<(&str, u8)> {
+        match self {
+            Ipv4AddressConfig::Cidr(s) => {
+                let (a, p) = s.split_once('/')?;
+                let plen: u8 = p.parse().ok()?;
+                Some((a, plen))
+            }
+            Ipv4AddressConfig::Split { address, prefix } => Some((address.as_str(), *prefix)),
+        }
+    }
 }
 
 /// Sub-interface (DHCP-relevant fields).
@@ -523,11 +550,12 @@ impl DhcpdConfig {
             let first = iface.ipv4.first().ok_or_else(|| {
                 anyhow::anyhow!("interface {} has dhcp_server_enabled but no ipv4 address", name)
             })?;
-            let address: Ipv4Addr = first
-                .address
+            let (addr_str, prefix_len) = first.as_pair().ok_or_else(|| {
+                anyhow::anyhow!("interface {}: malformed ipv4 entry (expected addr/prefix or {{address, prefix}})", name)
+            })?;
+            let address: Ipv4Addr = addr_str
                 .parse()
                 .map_err(|e| anyhow::anyhow!("interface {}: {}", name, e))?;
-            let prefix_len = first.prefix;
             let pool_start: Ipv4Addr = iface
                 .dhcp_server_pool_start
                 .as_deref()
@@ -873,4 +901,27 @@ fn parse_ipv6_list(strings: &[String], field: &str) -> anyhow::Result<Vec<Ipv6Ad
         out.push(a);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both wire shapes — CIDR string (what the current impd
+    /// serializer emits) and split-map (the legacy form) — must
+    /// deserialize and yield the same `(addr, prefix)` pair via
+    /// `as_pair()`. Without this, dhcpd crash-loops on every
+    /// startup against a yaml impd just wrote.
+    #[test]
+    fn ipv4_address_config_accepts_both_cidr_and_split() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Wrapper {
+            v: Vec<Ipv4AddressConfig>,
+        }
+        let yaml = "v:\n- 10.0.0.1/24\n- address: 10.0.0.2\n  prefix: 25\n";
+        let w: Wrapper = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(w.v.len(), 2);
+        assert_eq!(w.v[0].as_pair(), Some(("10.0.0.1", 24u8)));
+        assert_eq!(w.v[1].as_pair(), Some(("10.0.0.2", 25u8)));
+    }
 }

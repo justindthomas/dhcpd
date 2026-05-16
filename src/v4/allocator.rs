@@ -250,6 +250,7 @@ mod tests {
             interfaces: vec![],
             subnets: vec![],
             enabled_interfaces: vec![],
+            encrypted_dns: None,
         }
     }
 

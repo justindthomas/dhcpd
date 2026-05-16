@@ -30,8 +30,8 @@ use crate::packet::v4::client_id::ClientId;
 use crate::packet::v4::header::{BootOp, BootpHeader, BOOTP_FLAG_BROADCAST};
 use crate::packet::v4::message::{DhcpMessage, DhcpMessageType};
 use crate::packet::v4::options::{
-    client_requests_v6_only_preferred, find_client_identifier, find_option_82,
-    find_requested_ip, find_server_id, DhcpOption,
+    client_requests_dnr, client_requests_v6_only_preferred, find_client_identifier,
+    find_option_82, find_requested_ip, find_server_id, DhcpOption, DnrInstance,
 };
 use crate::v4::allocator::{AllocateResult, Allocator};
 
@@ -562,6 +562,19 @@ fn build_reply(
         opts.push(DhcpOption::DomainName(d.to_string()));
     }
 
+    // RFC 9463 DNR — advertise the encrypted-DNS (DoT) resolver, but
+    // only when the client requested option 162 in its parameter
+    // request list (RFC 9463 §4.2).
+    if let Some(edns) = &global.encrypted_dns {
+        if client_requests_dnr(&req.options) {
+            opts.push(DhcpOption::Dnr(vec![DnrInstance {
+                service_priority: edns.service_priority,
+                adn: edns.adn.clone(),
+                addrs: edns.servers.clone(),
+            }]));
+        }
+    }
+
     opts.push(DhcpOption::LeaseTime(lease_secs));
     // RFC 5107 §5.2: if the relay inserted Option 82 sub-option 11
     // (Server Identifier Override), use that address as the Server-ID
@@ -814,6 +827,7 @@ mod tests {
             interfaces: vec![],
             subnets: vec![],
             enabled_interfaces: vec![],
+            encrypted_dns: None,
         }
     }
 

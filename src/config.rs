@@ -81,6 +81,25 @@ pub struct DhcpConfig {
     /// Matches VPP interface names (e.g. "loop100", "lan.110").
     #[serde(default)]
     pub interfaces: Vec<String>,
+    /// RFC 9463 DNR — advertise an encrypted-DNS (DoT) resolver to
+    /// clients via OPTION_V4_DNR (162). Absent → option not sent.
+    #[serde(default)]
+    pub encrypted_dns: Option<EncryptedDnsRaw>,
+}
+
+/// YAML shape for the RFC 9463 DNR (Discovery of Network-designated
+/// Resolvers) resolver advertised to DHCPv4 clients. `adn` is the
+/// resolver's Authentication Domain Name — clients validate its TLS
+/// certificate against this name; `servers` are its IPv4 addresses;
+/// `service_priority` orders multiple resolvers (lower = preferred).
+/// The advertised transport is DNS-over-TLS.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct EncryptedDnsRaw {
+    pub adn: String,
+    #[serde(default)]
+    pub servers: Vec<String>,
+    #[serde(default)]
+    pub service_priority: u16,
 }
 
 /// YAML shape for a subnet entry. Fields are strings at this layer;
@@ -437,6 +456,15 @@ impl<'a> PoolSource6<'a> {
     }
 }
 
+/// Parsed, validated RFC 9463 DNR resolver advertised via
+/// OPTION_V4_DNR.
+#[derive(Debug, Clone)]
+pub struct EncryptedDns {
+    pub adn: String,
+    pub servers: Vec<Ipv4Addr>,
+    pub service_priority: u16,
+}
+
 /// Parsed, validated DHCPv4 daemon configuration.
 #[derive(Debug, Clone)]
 pub struct DhcpdConfig {
@@ -453,6 +481,9 @@ pub struct DhcpdConfig {
     /// (and not in `interfaces` above) are ignored — ingress DHCP
     /// on them is dropped. Empty list = no relay-mode opt-in.
     pub enabled_interfaces: Vec<String>,
+    /// RFC 9463 DNR resolver to advertise via OPTION_V4_DNR. `None`
+    /// → the option is not emitted.
+    pub encrypted_dns: Option<EncryptedDns>,
 }
 
 /// Parsed, validated DHCPv6 daemon configuration.
@@ -669,6 +700,27 @@ impl DhcpdConfig {
             }
         }
 
+        // RFC 9463 DNR resolver. Present only when an ADN is given;
+        // an explicitly-listed but unparseable server is a hard error
+        // (a silent drop would leave clients with no encrypted path).
+        let encrypted_dns = match &cfg.dhcp_server.encrypted_dns {
+            Some(raw) if !raw.adn.trim().is_empty() => {
+                let servers =
+                    parse_ipv4_list(&raw.servers, "encrypted_dns.servers")?;
+                if servers.is_empty() {
+                    anyhow::bail!(
+                        "dhcp_server.encrypted_dns.servers must not be empty"
+                    );
+                }
+                Some(EncryptedDns {
+                    adn: raw.adn.trim().to_string(),
+                    servers,
+                    service_priority: raw.service_priority,
+                })
+            }
+            _ => None,
+        };
+
         Ok(Some(DhcpdConfig {
             default_lease_time,
             max_lease_time,
@@ -679,6 +731,7 @@ impl DhcpdConfig {
             interfaces,
             subnets,
             enabled_interfaces: cfg.dhcp_server.interfaces.clone(),
+            encrypted_dns,
         }))
     }
 }

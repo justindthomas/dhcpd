@@ -14,4 +14,4 @@ pub mod options;
 pub use client_id::ClientId;
 pub use header::{BootOp, BootpHeader, DHCP_MAGIC_COOKIE};
 pub use message::{DhcpMessage, DhcpMessageType};
-pub use options::{DhcpOption, Option82, RouteEntry, DECODE_END_OF_OPTIONS};
+pub use options::{DhcpOption, DnrInstance, Option82, RouteEntry, DECODE_END_OF_OPTIONS};

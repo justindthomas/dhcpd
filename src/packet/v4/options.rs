@@ -26,6 +26,7 @@
 //! |  82  | 3046 | Relay Agent Information        | `RelayAgentInfo`     |
 //! | 108  | 8925 | IPv6-Only Preferred (V6ONLY_WAIT) | `V6OnlyPreferred` |
 //! | 121  | 3442 | Classless Static Route         | `ClasslessStaticRoute` |
+//! | 162  | 9463 | Encrypted DNS Option (DNR)     | `Dnr`                |
 //! | 255  | 2132 | End                            | implicit             |
 
 use std::net::Ipv4Addr;
@@ -56,6 +57,7 @@ pub const OPT_CLIENT_IDENTIFIER: u8 = 61;
 pub const OPT_RELAY_AGENT_INFO: u8 = 82;
 pub const OPT_V6_ONLY_PREFERRED: u8 = 108;
 pub const OPT_CLASSLESS_STATIC_ROUTE: u8 = 121;
+pub const OPT_DNR: u8 = 162;
 pub const OPT_END: u8 = 0xff;
 
 /// RFC 8925 §3.5: clients clamp any received V6ONLY_WAIT < 300 to 300.
@@ -102,6 +104,19 @@ pub struct Option82 {
     pub raw: Vec<u8>,
 }
 
+/// One encrypted-DNS resolver carried in OPTION_V4_DNR (RFC 9463) —
+/// a single "DNR Instance Data" block. SvcParams are not modelled:
+/// dhcpd always advertises DNS-over-TLS, encoded as a fixed
+/// `alpn=dot` SvcParams block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnrInstance {
+    pub service_priority: u16,
+    /// Authentication Domain Name in presentation form, e.g.
+    /// "dns.jdt.dev" — encoded to DNS wire format on the wire.
+    pub adn: String,
+    pub addrs: Vec<Ipv4Addr>,
+}
+
 /// A decoded DHCP option. Unknown codes land in `Unknown` so we can
 /// round-trip them if needed (rare but useful for logging).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +144,10 @@ pub enum DhcpOption {
     /// this when the client requested option 108 in its PRL.
     V6OnlyPreferred(u32),
     ClasslessStaticRoute(Vec<RouteEntry>),
+    /// RFC 9463 OPTION_V4_DNR — one or more encrypted-DNS resolvers.
+    /// Server-emitted; sent only when the client requests code 162
+    /// in its parameter request list.
+    Dnr(Vec<DnrInstance>),
     Unknown { code: u8, data: Vec<u8> },
 }
 
@@ -154,6 +173,7 @@ impl DhcpOption {
             DhcpOption::RelayAgentInfo(_) => OPT_RELAY_AGENT_INFO,
             DhcpOption::V6OnlyPreferred(_) => OPT_V6_ONLY_PREFERRED,
             DhcpOption::ClasslessStaticRoute(_) => OPT_CLASSLESS_STATIC_ROUTE,
+            DhcpOption::Dnr(_) => OPT_DNR,
             DhcpOption::Unknown { code, .. } => *code,
         }
     }
@@ -222,6 +242,9 @@ impl DhcpOption {
             }
             DhcpOption::ClasslessStaticRoute(entries) => {
                 encode_classless_routes(buf, entries);
+            }
+            DhcpOption::Dnr(instances) => {
+                encode_dnr(buf, instances);
             }
             DhcpOption::Unknown { code, data } => {
                 push_bytes(buf, *code, data);
@@ -332,6 +355,140 @@ fn encode_classless_routes(buf: &mut Vec<u8>, entries: &[RouteEntry]) {
     push_bytes(buf, OPT_CLASSLESS_STATIC_ROUTE, &body);
 }
 
+/// Fixed SvcParams advertising DNS-over-TLS — RFC 9460 §2.2 wire
+/// format: SvcParamKey 1 (`alpn`), value = one ALPN id `"dot"`.
+const DNR_SVCPARAMS_DOT: [u8; 8] = [0x00, 0x01, 0x00, 0x04, 0x03, b'd', b'o', b't'];
+
+/// Encode `adn` (presentation form, e.g. "dns.jdt.dev") into
+/// uncompressed DNS wire format: each label length-prefixed, the
+/// name terminated by a zero octet. A single trailing dot is
+/// tolerated. Returns `None` for an empty/oversized label or a name
+/// exceeding 255 octets.
+fn encode_adn(adn: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for label in adn.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    if out.is_empty() || out.len() + 1 > 255 {
+        return None;
+    }
+    out.push(0);
+    Some(out)
+}
+
+/// Decode an uncompressed DNS wire-format name back to presentation
+/// form. Used by the option decoder for round-tripping.
+fn decode_adn(wire: &[u8]) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut i = 0;
+    while i < wire.len() {
+        let len = wire[i] as usize;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || i + 1 + len > wire.len() {
+            return None;
+        }
+        labels.push(String::from_utf8_lossy(&wire[i + 1..i + 1 + len]).into_owned());
+        i += 1 + len;
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels.join("."))
+}
+
+/// Encode OPTION_V4_DNR (RFC 9463). Each instance becomes a "DNR
+/// Instance Data" block: `[data_len:2][svc_priority:2][adn_len:1]
+/// [adn][addr_len:1][ipv4...][svcparams]`. Instances with a
+/// malformed ADN are skipped.
+fn encode_dnr(buf: &mut Vec<u8>, instances: &[DnrInstance]) {
+    let mut body: Vec<u8> = Vec::new();
+    for inst in instances {
+        let Some(adn_wire) = encode_adn(&inst.adn) else {
+            tracing::warn!(adn = %inst.adn, "DNR: malformed ADN; skipping instance");
+            continue;
+        };
+        // Addr Length is a single octet (a multiple of 4); 63 IPv4
+        // addresses is already far more than any real deployment.
+        let addrs: Vec<&Ipv4Addr> = inst.addrs.iter().take(63).collect();
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&inst.service_priority.to_be_bytes());
+        data.push(adn_wire.len() as u8);
+        data.extend_from_slice(&adn_wire);
+        data.push((addrs.len() * 4) as u8);
+        for a in &addrs {
+            data.extend_from_slice(&a.octets());
+        }
+        data.extend_from_slice(&DNR_SVCPARAMS_DOT);
+        body.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        body.extend_from_slice(&data);
+    }
+    if body.is_empty() {
+        return;
+    }
+    // OPTION_V4_DNR is formally a concatenation-requiring option
+    // (RFC 3396) for bodies > 255 octets; a single DoT resolver
+    // instance is ~30 octets, so `push_bytes` (which drops oversized
+    // bodies) is adequate here.
+    push_bytes(buf, OPT_DNR, &body);
+}
+
+/// Decode an OPTION_V4_DNR body into its DNR Instance Data blocks.
+fn decode_dnr(body: &[u8]) -> Result<Vec<DnrInstance>, DhcpdError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        if i + 2 > body.len() {
+            return Err(DhcpdError::Parse("DNR: truncated instance length".into()));
+        }
+        let data_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        let start = i + 2;
+        let end = start + data_len;
+        if end > body.len() {
+            return Err(DhcpdError::Parse(format!(
+                "DNR: instance data length {} exceeds option body",
+                data_len
+            )));
+        }
+        let data = &body[start..end];
+        if data.len() < 3 {
+            return Err(DhcpdError::Parse("DNR: instance shorter than header".into()));
+        }
+        let service_priority = u16::from_be_bytes([data[0], data[1]]);
+        let adn_len = data[2] as usize;
+        if 3 + adn_len > data.len() {
+            return Err(DhcpdError::Parse("DNR: ADN length exceeds instance".into()));
+        }
+        let adn = decode_adn(&data[3..3 + adn_len])
+            .ok_or_else(|| DhcpdError::Parse("DNR: malformed ADN".into()))?;
+        let mut addrs = Vec::new();
+        let mut j = 3 + adn_len;
+        if j < data.len() {
+            let addr_len = data[j] as usize;
+            j += 1;
+            if addr_len % 4 != 0 || j + addr_len > data.len() {
+                return Err(DhcpdError::Parse("DNR: bad Addr Length".into()));
+            }
+            for c in data[j..j + addr_len].chunks_exact(4) {
+                addrs.push(Ipv4Addr::new(c[0], c[1], c[2], c[3]));
+            }
+            // Any remaining bytes are SvcParams — not modelled here.
+        }
+        out.push(DnrInstance {
+            service_priority,
+            adn,
+            addrs,
+        });
+        i = end;
+    }
+    Ok(out)
+}
+
 /// Decode an options area up to the first `END`. Returns the list
 /// of parsed options. PAD bytes are silently skipped. Options with
 /// invalid length or truncated body bail out with a Parse error.
@@ -407,6 +564,7 @@ fn decode_single(code: u8, body: &[u8]) -> Result<DhcpOption, DhcpdError> {
         OPT_CLASSLESS_STATIC_ROUTE => {
             DhcpOption::ClasslessStaticRoute(decode_classless_routes(body)?)
         }
+        OPT_DNR => DhcpOption::Dnr(decode_dnr(body)?),
         _ => DhcpOption::Unknown {
             code,
             data: body.to_vec(),
@@ -594,6 +752,15 @@ pub fn find_param_request_list(opts: &[DhcpOption]) -> Option<&[u8]> {
 pub fn client_requests_v6_only_preferred(opts: &[DhcpOption]) -> bool {
     find_param_request_list(opts)
         .map(|prl| prl.contains(&OPT_V6_ONLY_PREFERRED))
+        .unwrap_or(false)
+}
+
+/// True if the client's parameter request list (option 55) asks for
+/// OPTION_V4_DNR (162). RFC 9463 §4.2: the server includes the DNR
+/// option only when the client requested it.
+pub fn client_requests_dnr(opts: &[DhcpOption]) -> bool {
+    find_param_request_list(opts)
+        .map(|prl| prl.contains(&OPT_DNR))
         .unwrap_or(false)
 }
 
@@ -811,5 +978,29 @@ mod tests {
         assert_eq!(find_requested_ip(&opts), Some("10.0.0.5".parse().unwrap()));
         assert_eq!(find_server_id(&opts), Some("10.0.0.1".parse().unwrap()));
         assert_eq!(find_client_identifier(&opts), Some([1, 2, 3, 4, 5, 6, 7].as_ref()));
+    }
+
+    #[test]
+    fn dnr_encode_decode_round_trips() {
+        let inst = DnrInstance {
+            service_priority: 1,
+            adn: "dns.jdt.dev".to_string(),
+            addrs: vec!["192.168.20.1".parse().unwrap()],
+        };
+        let opt = DhcpOption::Dnr(vec![inst.clone()]);
+        let mut buf = Vec::new();
+        opt.encode(&mut buf);
+        assert_eq!(buf[0], OPT_DNR);
+        buf.push(OPT_END);
+        let decoded = decode_options(&buf).unwrap();
+        assert_eq!(decoded, vec![DhcpOption::Dnr(vec![inst])]);
+    }
+
+    #[test]
+    fn client_requests_dnr_via_prl() {
+        let with = vec![DhcpOption::ParamRequestList(vec![1, 6, 162, 51])];
+        assert!(client_requests_dnr(&with));
+        let without = vec![DhcpOption::ParamRequestList(vec![1, 6, 51])];
+        assert!(!client_requests_dnr(&without));
     }
 }

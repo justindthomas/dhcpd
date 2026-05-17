@@ -104,10 +104,22 @@ pub struct Option82 {
     pub raw: Vec<u8>,
 }
 
+/// Encrypted transport advertised by a DNR instance — selects the
+/// fixed SvcParams block encoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnrTransport {
+    /// DNS-over-TLS — SvcParams `alpn=dot` (port 853 implied).
+    Dot,
+    /// DNS-over-HTTPS — SvcParams `alpn=h2` + `dohpath` (port 443
+    /// implied). RFC 9461 §5 requires `dohpath` whenever the ALPN
+    /// indicates HTTP.
+    Doh,
+}
+
 /// One encrypted-DNS resolver carried in OPTION_V4_DNR (RFC 9463) —
-/// a single "DNR Instance Data" block. SvcParams are not modelled:
-/// dhcpd always advertises DNS-over-TLS, encoded as a fixed
-/// `alpn=dot` SvcParams block.
+/// a single "DNR Instance Data" block. The SvcParams are not modelled
+/// field-by-field: `transport` selects one of the two fixed SvcParams
+/// blocks (`alpn=dot`, or `alpn=h2` + `dohpath`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnrInstance {
     pub service_priority: u16,
@@ -115,6 +127,7 @@ pub struct DnrInstance {
     /// "dns.jdt.dev" — encoded to DNS wire format on the wire.
     pub adn: String,
     pub addrs: Vec<Ipv4Addr>,
+    pub transport: DnrTransport,
 }
 
 /// A decoded DHCP option. Unknown codes land in `Unknown` so we can
@@ -359,6 +372,54 @@ fn encode_classless_routes(buf: &mut Vec<u8>, entries: &[RouteEntry]) {
 /// format: SvcParamKey 1 (`alpn`), value = one ALPN id `"dot"`.
 const DNR_SVCPARAMS_DOT: [u8; 8] = [0x00, 0x01, 0x00, 0x04, 0x03, b'd', b'o', b't'];
 
+/// Fixed SvcParams advertising DNS-over-HTTPS — RFC 9460 §2.2 wire
+/// format, keys ascending: SvcParamKey 1 (`alpn`) = one ALPN id
+/// `"h2"`, then SvcParamKey 7 (`dohpath`, RFC 9461 §5) = the URI
+/// Template `/dns-query{?dns}`. The `port` SvcParam is omitted — RFC
+/// 9461 §3 defines 443 as the DoH default.
+///   00 01 00 03 02 'h' '2'                 alpn = ["h2"]
+///   00 07 00 10 "/dns-query{?dns}"         dohpath (16-octet value)
+const DNR_SVCPARAMS_DOH: [u8; 27] = [
+    0x00, 0x01, 0x00, 0x03, 0x02, b'h', b'2',
+    0x00, 0x07, 0x00, 0x10, b'/', b'd', b'n', b's', b'-', b'q', b'u', b'e',
+    b'r', b'y', b'{', b'?', b'd', b'n', b's', b'}',
+];
+
+/// Classify a DNR instance's trailing SvcParams block. Walks the
+/// `[key:2][len:2][value]` triples looking for the `alpn` SvcParam
+/// (key 1); an `h2` ALPN id means DoH. Anything else — including a
+/// malformed or absent block — defaults to DoT, the conservative
+/// choice (DoT needs no `dohpath`, so a mis-classification can't
+/// produce an unusable instance).
+fn svcparams_transport(sp: &[u8]) -> DnrTransport {
+    let mut i = 0;
+    while i + 4 <= sp.len() {
+        let key = u16::from_be_bytes([sp[i], sp[i + 1]]);
+        let len = u16::from_be_bytes([sp[i + 2], sp[i + 3]]) as usize;
+        let val_start = i + 4;
+        if val_start + len > sp.len() {
+            break;
+        }
+        if key == 1 {
+            // alpn value: a sequence of [id_len:1][id...] entries.
+            let mut j = val_start;
+            while j < val_start + len {
+                let id_len = sp[j] as usize;
+                j += 1;
+                if j + id_len > val_start + len {
+                    break;
+                }
+                if &sp[j..j + id_len] == b"h2" {
+                    return DnrTransport::Doh;
+                }
+                j += id_len;
+            }
+        }
+        i = val_start + len;
+    }
+    DnrTransport::Dot
+}
+
 /// Encode `adn` (presentation form, e.g. "dns.jdt.dev") into
 /// uncompressed DNS wire format: each label length-prefixed, the
 /// name terminated by a zero octet. A single trailing dot is
@@ -424,7 +485,10 @@ fn encode_dnr(buf: &mut Vec<u8>, instances: &[DnrInstance]) {
         for a in &addrs {
             data.extend_from_slice(&a.octets());
         }
-        data.extend_from_slice(&DNR_SVCPARAMS_DOT);
+        match inst.transport {
+            DnrTransport::Dot => data.extend_from_slice(&DNR_SVCPARAMS_DOT),
+            DnrTransport::Doh => data.extend_from_slice(&DNR_SVCPARAMS_DOH),
+        }
         body.extend_from_slice(&(data.len() as u16).to_be_bytes());
         body.extend_from_slice(&data);
     }
@@ -468,6 +532,7 @@ fn decode_dnr(body: &[u8]) -> Result<Vec<DnrInstance>, DhcpdError> {
             .ok_or_else(|| DhcpdError::Parse("DNR: malformed ADN".into()))?;
         let mut addrs = Vec::new();
         let mut j = 3 + adn_len;
+        let mut svcparams: &[u8] = &[];
         if j < data.len() {
             let addr_len = data[j] as usize;
             j += 1;
@@ -477,12 +542,14 @@ fn decode_dnr(body: &[u8]) -> Result<Vec<DnrInstance>, DhcpdError> {
             for c in data[j..j + addr_len].chunks_exact(4) {
                 addrs.push(Ipv4Addr::new(c[0], c[1], c[2], c[3]));
             }
-            // Any remaining bytes are SvcParams — not modelled here.
+            // Any remaining bytes are the SvcParams block.
+            svcparams = &data[j + addr_len..];
         }
         out.push(DnrInstance {
             service_priority,
             adn,
             addrs,
+            transport: svcparams_transport(svcparams),
         });
         i = end;
     }
@@ -982,18 +1049,28 @@ mod tests {
 
     #[test]
     fn dnr_encode_decode_round_trips() {
-        let inst = DnrInstance {
+        // A DoT instance and a DoH instance — the shape the server
+        // emits per resolver. Both must survive encode → decode,
+        // including the transport classification from SvcParams.
+        let dot = DnrInstance {
             service_priority: 1,
             adn: "dns.jdt.dev".to_string(),
             addrs: vec!["192.168.20.1".parse().unwrap()],
+            transport: DnrTransport::Dot,
         };
-        let opt = DhcpOption::Dnr(vec![inst.clone()]);
+        let doh = DnrInstance {
+            service_priority: 2,
+            adn: "dns.jdt.dev".to_string(),
+            addrs: vec!["192.168.20.1".parse().unwrap()],
+            transport: DnrTransport::Doh,
+        };
+        let opt = DhcpOption::Dnr(vec![dot.clone(), doh.clone()]);
         let mut buf = Vec::new();
         opt.encode(&mut buf);
         assert_eq!(buf[0], OPT_DNR);
         buf.push(OPT_END);
         let decoded = decode_options(&buf).unwrap();
-        assert_eq!(decoded, vec![DhcpOption::Dnr(vec![inst])]);
+        assert_eq!(decoded, vec![DhcpOption::Dnr(vec![dot, doh])]);
     }
 
     #[test]

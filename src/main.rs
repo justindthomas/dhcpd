@@ -41,6 +41,44 @@ use dhcpd::vpp_iface;
 
 const DEFAULT_LEASE_DB: &str = "/var/lib/dhcpd";
 
+/// Build the v4 serving config for an interface opted in via
+/// `dhcp_server.interfaces`. If the interface's address falls inside a
+/// configured `dhcp_server.subnets[]` entry, serve that subnet's pool
+/// directly — the common router-on-a-LAN case (direct broadcast,
+/// `giaddr == 0`), and what `dhcp_server.interfaces` being the serving
+/// opt-in implies. Otherwise the interface is relay-ingress only: an
+/// empty pool (`start > end`) blocks direct allocation while the FSM's
+/// giaddr subnet-match still serves relayed DISCOVERs via `subnets[]`.
+fn optin_iface_v4(iface: &IoInterface, addr: Ipv4Addr, v4_cfg: &DhcpdConfig) -> InterfaceV4Config {
+    if let Some(subnet) = v4_cfg.find_subnet(addr) {
+        InterfaceV4Config {
+            name: iface.name.clone(),
+            address: addr,
+            prefix_len: subnet.subnet.prefix_len(),
+            pool_start: subnet.pool_start,
+            pool_end: subnet.pool_end,
+            gateway: subnet.gateway,
+            lease_time: subnet.lease_time,
+            dns_servers: subnet.dns_servers.clone(),
+            domain_name: subnet.domain_name.clone(),
+            trust_relay: subnet.trust_relay,
+        }
+    } else {
+        InterfaceV4Config {
+            name: iface.name.clone(),
+            address: addr,
+            prefix_len: iface.ipv4_prefix_len,
+            pool_start: Ipv4Addr::BROADCAST,
+            pool_end: Ipv4Addr::UNSPECIFIED,
+            gateway: addr,
+            lease_time: None,
+            dns_servers: vec![],
+            domain_name: None,
+            trust_relay: false,
+        }
+    }
+}
+
 enum Command {
     Run(RunArgs),
     Query(QueryArgs),
@@ -645,24 +683,7 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     );
                     continue;
                 };
-                iface_map.insert(
-                    iface.sw_if_index,
-                    dhcpd::config::InterfaceV4Config {
-                        name: iface.name.clone(),
-                        address: addr,
-                        prefix_len: iface.ipv4_prefix_len,
-                        // Empty pool — direct-broadcast allocation is
-                        // blocked here. The FSM's subnet-match handles
-                        // giaddr-relayed DISCOVERs via `subnets[]`.
-                        pool_start: Ipv4Addr::BROADCAST,
-                        pool_end: Ipv4Addr::UNSPECIFIED,
-                        gateway: addr,
-                        lease_time: None,
-                        dns_servers: vec![],
-                        domain_name: None,
-                        trust_relay: false,
-                    },
-                );
+                iface_map.insert(iface.sw_if_index, optin_iface_v4(iface, addr, v4_cfg));
             }
         }
         let store = LeaseStoreV4::open(&args.lease_db)
@@ -908,21 +929,7 @@ async fn reload_config(
                         let Some(addr) = iface.ipv4_address else {
                             continue;
                         };
-                        iface_map.insert(
-                            iface.sw_if_index,
-                            InterfaceV4Config {
-                                name: iface.name.clone(),
-                                address: addr,
-                                prefix_len: iface.ipv4_prefix_len,
-                                pool_start: Ipv4Addr::BROADCAST,
-                                pool_end: Ipv4Addr::UNSPECIFIED,
-                                gateway: addr,
-                                lease_time: None,
-                                dns_servers: vec![],
-                                domain_name: None,
-                                trust_relay: false,
-                            },
-                        );
+                        iface_map.insert(iface.sw_if_index, optin_iface_v4(iface, addr, v4_cfg));
                     }
                 }
                 let prev_iface_count = server.interfaces.len();

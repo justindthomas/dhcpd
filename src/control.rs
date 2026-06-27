@@ -515,7 +515,30 @@ fn build_iface_status(iface: &IoInterface, snap: &ControlSnapshot) -> InterfaceS
             end: c.pool_end.to_string(),
             gateway: c.gateway.to_string(),
             lease_time: c.lease_time,
+        })
+        // An opt-in interface with no explicit per-interface pool serves
+        // its matching subnet directly (direct broadcast) — surface that
+        // subnet's pool so the interface doesn't misreport as relay-only.
+        // Mirrors the runtime resolution in `optin_iface_v4`.
+        .or_else(|| {
+            let addr = iface.ipv4_address?;
+            if !snap.v4_relay_interface_names.iter().any(|n| n == &iface.name) {
+                return None;
+            }
+            snap.v4_subnets
+                .iter()
+                .filter(|s| s.subnet.contains(&addr))
+                .max_by_key(|s| s.subnet.prefix_len())
+                .map(|s| PoolRange4 {
+                    start: s.pool_start.to_string(),
+                    end: s.pool_end.to_string(),
+                    gateway: s.gateway.to_string(),
+                    lease_time: s.lease_time,
+                })
         });
+    // Relay-ingress only when opted in but serving no direct pool.
+    let v4_relay_ingress =
+        v4_pool.is_none() && snap.v4_relay_interface_names.iter().any(|n| n == &iface.name);
     let v6_cfg = snap.v6_iface_configs.iter().find(|c| c.name == iface.name);
     let v6_pool = v6_cfg.and_then(|c| match (c.pool_start, c.pool_end) {
         (Some(s), Some(e)) => Some(PoolRange6 {
@@ -552,10 +575,7 @@ fn build_iface_status(iface: &IoInterface, snap: &ControlSnapshot) -> InterfaceS
         ipv4_prefix_len: iface.ipv4_prefix_len,
         ipv6_link_local: iface.ipv6_link_local.map(|a| a.to_string()),
         v4_pool,
-        v4_relay_ingress: snap
-            .v4_relay_interface_names
-            .iter()
-            .any(|n| n == &iface.name),
+        v4_relay_ingress,
         v6_pool,
         v6_pd_pool,
         v6_only_preferred,

@@ -148,7 +148,15 @@ impl<'a> Allocator<'a> {
             return true;
         }
         match lease.state {
-            LeaseState::Bound => false,
+            // A Bound lease blocks the IP only while it's still valid.
+            // Once it expires, the address returns to the pool and is
+            // available to any client (RFC 2131 §4.4.5). Nothing else
+            // transitions an expired Bound lease to `Expired` (there is
+            // no reaper), so without this expiry check an expired-but-
+            // still-Bound lease would never be reclaimable — a slow pool
+            // leak that exhausts the range. `expires_unix == u64::MAX`
+            // (static / infinite leases) is never reclaimed.
+            LeaseState::Bound => now >= lease.expires_unix,
             LeaseState::Declined => now >= lease.expires_unix.saturating_add(QUARANTINE_SECS),
             LeaseState::Released => true,
             LeaseState::Expired => true,
@@ -448,6 +456,33 @@ mod tests {
                 granted_unix: 0,
                 expires_unix: 1_999_999_999,
                 state: LeaseState::Released,
+            })
+            .unwrap();
+        let a = Allocator::new(&iface, &global);
+        let r = a.pick(&cid(&[1; 6]), Some([1; 6]), None, &store);
+        assert_eq!(r, AllocateResult::Available(Ipv4Addr::new(10, 0, 0, 100)));
+    }
+
+    #[test]
+    fn expired_bound_ip_reclaimable_by_another_client() {
+        // Regression: a Bound lease past its expiry must return to the
+        // pool. Nothing reaps it to `Expired`, so before the expiry check
+        // in ip_available this single-slot pool would return Exhausted
+        // forever (silent pool leak). The future-dated Bound case is
+        // covered by pool_exhausted_returns_exhausted.
+        let iface = mk_iface([10, 0, 0, 100], [10, 0, 0, 100]);
+        let global = mk_global(vec![]);
+        let dir = tempdir().unwrap();
+        let mut store = LeaseStoreV4::open(dir.path()).unwrap();
+        store
+            .bind(Lease {
+                client_id: vec![9; 6],
+                ip: Ipv4Addr::new(10, 0, 0, 100),
+                mac: [9; 6],
+                hostname: None,
+                granted_unix: 0,
+                expires_unix: 1, // already expired
+                state: LeaseState::Bound,
             })
             .unwrap();
         let a = Allocator::new(&iface, &global);
